@@ -1,173 +1,225 @@
-#include <Arduino.h>
-#include "ESPNetworkManager.h"
-#include <PubSubClient.h>
-#include <DNSServer.h>
 #include "Adafruit_VL53L0X.h"
-
-//Module Vars
+#include "ESPNetworkManager.h"
+#include <Arduino.h>
+#include <DNSServer.h>
+#include <PubSubClient.h> //Βιβλιοθήκη για δημιουργία πελάτη Mqtt (Nick O'Leary)
+/** Αρχικοποίηση μεταβλητών */
+//Δημιουργια αναγνωρηστικου Μικροελεγκτή ModuleID
 String ModuleID = String(ESP.getChipId());
-String mcu_type = "output";
-String myTopic = ("/" + mcu_type + "/" + ModuleID+ "/" +"data");
-String settingsTopic= ("/" + mcu_type + "/" + ModuleID+ "/" +"settings");
-String willTopic=("/" + mcu_type + "/" + ModuleID+ "/" +"lastwill");
-String controlType="analog";
+String mcu_type = "output"; // O Μικροελεγκτής λειτουργει ως έξοδος δεδομένων
 
-//Mqtt Client Setup
-const char* micro_mqtt_broker = "educ.chem.auth.gr";
-const char* mqtt_username ;
-const char* mqtt_password ;
-int retries=0;
+//Θέματα στα οποία δέχεται και στέλνει Mqtt Μηνύματα ο Μικροελεγκτής
+String myTopic = ("/" + mcu_type + "/" + ModuleID + "/" + "data");
+String settingsTopic = ("/" + mcu_type + "/" + ModuleID + "/" + "settings");
+String willTopic = ("/" + mcu_type + "/" + ModuleID + "/" + "lastwill");
+String controlType =
+    "analog"; //Τρόπος ελέγχου των συσκευών(ControlType). Χρησιμοποιείτε
+              //για την σωστή δημιουργία εργαλείων ελέγχου στις συσκευές Android
+
+//Αρχικοποίηση μεταβλητών πελάτη Mqtt (PubSubClient)
+const char *micro_mqtt_broker = "educ.chem.auth.gr";
+const char *mqtt_username;
+const char *mqtt_password;
+int retries = 0;
 WiFiClient sclient;
 PubSubClient mqtt_client(sclient);
-//NetworkManager
+
+//Αρχικοποίηση βιβλιοθήκης που αναλαμβάνει την "κατάσταση
+//ρύθμισης" του Esp8266
 EspNetworkManager netmanager(ModuleID);
-//Wifi Connection
+
+//Αρχικοποίηση μεταβλητών σύνδεσης Wi-Fi
 String WiFiSSID;
 String WiFiPassword;
 
-// Adafruit_VL53L0X
+//Αρχικοποίηση αισθητήρα απόστασης Adafruit_VL53L0X
 Adafruit_VL53L0X lox = Adafruit_VL53L0X();
-int datasets=0;
-long lastMsg = 0;
+int datasets = 0; //αριθμός μετρήσεων
+long lastMsg = 0; //στιγμη τελευταιας μετρησης
 unsigned long last_time;
-unsigned long currentMillis ;
-//Functions
-void  ExplicitRunNetworkManager(void);
-void onMessageReceived(char*, byte*, unsigned int);
-boolean ConnectToNetwork(void);
-void MqttReconnect(void);
+unsigned long currentMillis; //Τωρινή στιγμή
 
-
+//Δηλώσεις Μεθόδων
+void ExplicitRunNetworkManager(
+    void); //Μέθοδος που καλεί την βιβλιοθήκη EspNetworkManager
+void onMessageReceived(
+    char *, byte *,
+    unsigned int); // Callback που καλείτε όταν ληφθεί μήνυμα MQTT
+boolean ConnectToNetwork(void); //Μέθοδος σύνδεσης σε τοπικό δίκτυο Wi-Fi
+void MqttReconnect(void); //Μέθοδος σύνδεσης - επανασύνδεσης σε μεσίτη MQTT
 
 void setup() {
-    EEPROM.begin(512);
-    Serial.begin(115200);
- Serial.println("");
+  EEPROM.begin(512);
+  Serial.begin(115200); //Σειριακή επικοινωνία για debugging με baudrate 115200
+  Serial.println("");
+  /**Αξιολόγηση αν χρειάζεται η "Λειτουργία ρυθμίσεων". Αν μπορει να συνδεθεί σε
+   * τοπικό
+   * δίκτυο ,τότε  δεν χρειάζεται.*/
   if (!ConnectToNetwork()) {
+    //Αν δεν μπορέσεις να συνδεθείς στο δίκτυο ξεκίνα την "Λειτουργία Ρυθμίσεων"
+    //μέσω την βιβλιοθήκης EspNetworkManager
     ExplicitRunNetworkManager();
   }
 
   mqtt_client.setServer("educ.chem.auth.gr", 1883);
   mqtt_client.setCallback(onMessageReceived);
+  //Έλεγχος επικοινωνίας με τον αισθητήρα VL53L0X
   Serial.println("Adafruit VL53L0X test");
   if (!lox.begin()) {
+    //Αποτυχια επικοινωνίας ελεγξε την σύνδεση των καλωδίων
     Serial.println(F("Failed to boot VL53L0X"));
-  }else{
+  } else {
     Serial.println("VL53L0X Success");
   }
-
 }
 
+/*Κεντρική λούπα προγράμματος*/
 void loop() {
+  //Πάντα προσπαθεί  να συνδεθεί στο μεσίτη, επαναλαμβάνει αν δεν τα καταφέρει.
   if (!mqtt_client.connected()) {
     MqttReconnect();
   }
-  mqtt_client.loop();
-   long now = millis();
-   String message = "Out of Range";
-   VL53L0X_RangingMeasurementData_t measure;
-   lox.rangingTest(&measure, false); // pass in 'true' to get debug data printout!
-   if (measure.RangeStatus != 4) {  // phase failures have incorrect data
-    if (now - lastMsg > 50 && datasets<3 ) {
+  mqtt_client.loop();              //Μέθοδος που καλείτε για να λειτουργήσει το callback των
+                                   //μηνυμάτων MQTT
+                                   /*Συνεχέις μέτρηση απόστασης με τον αισθητήρα VL53L0X*/
+  long now = millis();             //Μέτρηση χρόνου
+  String message = "Out of Range"; //Αρχικοποίηση ειδοποίησης
+  VL53L0X_RangingMeasurementData_t measure; //Αρχικοποίηση αντικειμένου μέτρσηςη
+  //της βιβλιοθήκης Adafruit_VL53L0X
+  lox.rangingTest(
+      &measure,
+      false); // Στειλε 'true' για να εμφανιστουν μυνήματα debug στην σειριακή
+  /*Η ανιχνευση γίνετε μόνο όταν υπαρξει αντικείμενο μπροστα στον αισθητήρα*/
+  if (measure.RangeStatus != 4) { //Ελεγχος σωστής μέτρησης
+                                  /*για κάθε εμφάνηση αντικειμένου μπροστά στον αισθητήρα περνονται 3 τιμες σε
+                                   * απόσταστη 50ms*/
+    if (now - lastMsg > 50 &&
+        datasets <
+            3) { //αν πέρασας 50 milisecond και δεν έχουν καταγραφει 3 τιμές
+                 //συνέχισε να καταγράφεις τιμες
       lastMsg = now;
       Serial.print("Distance (mm): ");
       Serial.println(measure.RangeMilliMeter);
       Serial.print("Reading a measurement... ");
-      message = (String) measure.RangeMilliMeter;
-      mqtt_client.publish(myTopic.c_str(), message.c_str());
+      message = (String)measure.RangeMilliMeter;
+      mqtt_client.publish(myTopic.c_str(),
+                          message.c_str()); //Αποστολή τιμών στον MQTT μεσίτη
       datasets++;
-    } else{
-    datasets=0;
+    } else {
+      datasets = 0;
     }
   }
 }
-
 
 void MqttReconnect() {
-	// Προσπάθησε να συνδεθείς μέχρι να τα καταφερεις
+  // Προσπάθησε να συνδεθείς μέχρι να τα καταφερεις
   Serial.print("Connecting to Push Service...");
-
-		// Συνδέσου στον server που ορίσαμε με username:androiduse,password:and3125
-		if (!mqtt_client.connect(ModuleID.c_str(),"androiduse","and3125")) {
-      delay(1000);
+  // Συνδέσου στον server που ορίσαμε με username: androiduse, password:and3125
+  //Οι μεταβλητές αυτές διαβάζονται από την βιβλιοθήκη EspNetworkManager η οποία
+  //τις ανακαλέι απο την ROM
+  if (!mqtt_client.connect(ModuleID.c_str(),
+                           netmanager.ReadBrokerUsername().c_str(),
+                           netmanager.ReadBrokerPassword().c_str())) {
+    delay(1000);
+    retries++;
+    if (retries <= 4) {
+      Serial.print("Failed to connect, mqtt_rc=");
+      Serial.print(mqtt_client.state()); //Αποσφαλμάτωση αποτυχίας σύνδεσης
+      Serial.println(" Retrying in 2 seconds");
       retries++;
-      if (retries<=4) {
-  			Serial.print("Failed to connect, mqtt_rc=");
-  			Serial.print(mqtt_client.state());
-  			Serial.println(" Retrying in 2 seconds");
-        retries++;
-      }else{
-        retries=0;
-        ExplicitRunNetworkManager();
-      }
-      return;
-    }else{
-      delay(500);
-      Serial.println("Connected Sucessfully");
-      //TODO PubSub Here
-      mqtt_client.subscribe("/android/synchronize");
-      mqtt_client.subscribe(myTopic.c_str());
-      mqtt_client.subscribe(settingsTopic.c_str());
+    } else {
+      retries = 0;
+      ExplicitRunNetworkManager(); //Εκκίνηση της "Λειτουργίας ρυθμίσεων"
     }
-}
-
-void  ExplicitRunNetworkManager(){
-  netmanager.begin();
-  if (!netmanager.runManager()) {
-    Serial.println("Manager Failed");
-  }else{
-    Serial.println("Credentials Received");
-    Serial.println(netmanager.ReadSSID());
-    Serial.println(netmanager.ReadPASSWORD());
+    return;
+  } else {
+    delay(500);
+    Serial.println("Connected Sucessfully");
+    //Εγγραφή στα απαραίτητα θέματα
+    mqtt_client.subscribe("/android/synchronize"); //Θέμα συγχρονισμού Android
+    mqtt_client.subscribe(myTopic.c_str()); //Θέμα αποστολής δεδομένων αισθητήρα
+    mqtt_client.subscribe(settingsTopic.c_str()); //θέμα ρυθμίσεων μΕ
   }
 }
 
-void onMessageReceived(char* topic, byte* payload, unsigned int length) {
-	//TODO: Add critical notification kai web setup signal
+void ExplicitRunNetworkManager() {
+  netmanager.begin(); //Αρχικοποίηση EspNetworkManager
+  if (!netmanager.runManager()) {
+    Serial.println("Manager Failed");
+  } else //Η διεργασίες της βιβλιοθήκης EspNetworkManager εκτελέστηκα επιτυχώς ο
+  //χρήστης καταχώρησε κωδικούς και ονόματα
+  {
+    Serial.println("Credentials Received");
+    Serial.println(
+        netmanager.ReadSSID()); //Δειξε το ονομα δικτυου που διάλεξε ο χρήστης
+    Serial.println(netmanager.ReadPASSWORD()); //Δείξει τον κωδικο δικτυου
+  }
+}
+
+void onMessageReceived(char *topic, byte *payload,
+                       unsigned int length) /*Λήφθηκε Μήνυμα Mqtt*/
+{
+  //Δείξε το Mqtt θέμα μέσω σειριακής
   Serial.print("Inoming Message [Topic: ");
   Serial.print(topic);
   Serial.print("] Message: ");
   String androidID;
-  for (int i = 0; i < length; i++) {
+  for (int i = 0; i < length;
+       i++) //Μετατροπή μηνύματος σε String και προβολή του
+  {
     Serial.print((char)payload[i]);
     androidID += (char)payload[i];
   }
   Serial.println();
-  if (strcmp(topic, "/android/synchronize") == 0)
+  if (strcmp(topic, "/android/synchronize") ==
+      0) /*Μια συσκευή Android ζήτησε συγχρονισμό */
   {
     Serial.println("Android asking for mC ID");
+    //Το μήνυμα περιέχει το ID της συσκευής android. Ετσι μπορούμε να βρούμε το
+    //θέμα(newAndroidTopic)
+    //οπού πρέπει να στείλουμε τις πληροφορίες αυτής της συσκευής.
     String newAndroidTopic = ("/android/" + androidID + "/newmodules");
-    String myInfo = (ModuleID + "&" + mcu_type+"&"+controlType+ "&" + "Distance Sensor");
-    mqtt_client.publish((newAndroidTopic.c_str()), (myInfo.c_str()));
+    //Δημιούργησε τα string που περιέχουν όλες τις πληροφορίες αυτής της
+    //συσκευής.
+    //Κάθε μεταβλητή χωρίζεται με τον χαρακτήρα "&" ώστε να μπορει να διαβαστεί
+    //από την συσκευή Android
+    String myInfo = (ModuleID + "&" + mcu_type + "&" + controlType + "&" +
+                     "Distance Sensor"); //Πληροφορίες αισθητήρα για δημιουργια
+                                         //αντικειμένου απο την συσκευή Android
+    mqtt_client.publish(
+        (newAndroidTopic.c_str()),
+        (myInfo.c_str())); //Αποστολή πληροφοριών στης συσκευή που τις ζήτησε
     delay(2);
   }
 }
 
-boolean ConnectToNetwork(){
-  WiFi.mode(WIFI_STA);
-	delay(10);
-	Serial.println("WIFI>>:Attempting Connection to ROM Saved Network");
-	String netssid = netmanager.ReadSSID();
-	Serial.println("WIFI>>Network: "+netssid);
-	String netpass = netmanager.ReadPASSWORD();
-	WiFi.begin(netssid.c_str(),netpass.c_str());
-	int attemps = 0;
-	while (WiFi.status() != WL_CONNECTED) {
-		delay(500);
-		Serial.print(".");
-		if (WiFi.status() == WL_CONNECT_FAILED || attemps>21)
-		{
-			Serial.println("");
-			Serial.println("WIFI>>:Connection Failed. Starting Network Manager.");
-      //TODO Remove this delay at release
+boolean ConnectToNetwork() {
+  WiFi.mode(WIFI_STA); //Ο μΕ γίνεται Wi-Fi Station
+  delay(10);
+  Serial.println("WIFI>>:Attempting Connection to ROM Saved Network");
+  String netssid = netmanager.ReadSSID(); //Ανάγνωση SSID δικτύου από την ROM
+  Serial.println("WIFI>>Network: " + netssid);
+  String netpass =
+      netmanager.ReadPASSWORD(); //Ανάγνωση Κωδικού δικτύου από την ROM
+  WiFi.begin(netssid.c_str(), netpass.c_str()); // Σύνδεση
+  int attemps = 0;
+  while (WiFi.status() != WL_CONNECTED) //Έλεγχος αν είναι συνδεδεμένο
+  {
+    delay(500);
+    Serial.print(".");
+    if (WiFi.status() == WL_CONNECT_FAILED ||
+        attemps > 20) //Η σύνδεση θεωρείται αποτυχημένη μετα από 20 προσπάθειες
+    {
+      Serial.println("");
+      Serial.println("WIFI>>:Connection Failed. Starting Network Manager.");
       delay(10);
-			return false;
-		}
-		attemps++;
-	}
-	Serial.println("");
-	Serial.println("WIFI>>:Connected");
-	Serial.print("WIFI>>:IPAddress: ");
-	Serial.println(WiFi.localIP());
+      return false;
+    }
+    attemps++;
+  } //Επιτύχής σύνδεση
+  Serial.println("");
+  Serial.println("WIFI>>:Connected");
+  Serial.print("WIFI>>:IPAddress: ");
+  Serial.println(WiFi.localIP());
   return true;
 }
